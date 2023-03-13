@@ -1,86 +1,136 @@
 ---
 apiVersion: tekton.dev/v1beta1
-kind: Pipeline
+kind: Task
 metadata:
-  name: cd-pipeline
+  name: execute-on-satelite
 spec:
   params:
-    - name: deployment-branch
-      description: the branch for the git repo
-      default: "master"
-    - name: configuration-name
-      description: configuration-name
+    - name: ibmcloud-api
+      description: the ibmcloud api
+      default: https://cloud.ibm.com
+    - name: continuous-delivery-context-secret
+      description: name of the configmap containing the continuous delivery pipeline context secrets
+      default: secure-properties
+    - name: kubernetes-service-apikey-secret-key
+      description: field in the secret that contains the api key used to login to ibmcloud kubernetes service
+      default: apikey
+    - name: resource-group
+      description: target resource group (name or id) for the ibmcloud login operation
+      default: ""
     - name: directory-path
-      description: directory where deployment files are located
+    - name: image-url
+      description: URL of an image that is relevant to the deployment action
+      default: ""
+    - name: shuttle-properties-file
+      description: name of the properties file that contain properties to include in the environment for the `cf-commands` snippet/script execution
+      default: ""
+    - name: setup-script
+      description: script that typically set up environment before the _deployment_ script execution.
+      default: ""
+    - name: script
+      description: _deployment_ script to be executed
+      default: ""
+    - name: post-execution-script
+      description: script that get executed after the _deployment_ script has been executed.
+      default: ""
     - name: pipeline-debug
+      description: Pipeline debug mode. Value can be 0 or 1. Default to 0
       default: "0"
-    - name: apikey
-    - name: toolchain-apikey
-    - name: git-token
-      description: access token for the git repo
-    - name: source-repo
-      description: The variable storing git integration for the repository storing build deployment files.
-    - name: api
-      description: the IBM Cloud api endpoint
-      default: "https://cloud.ibm.com"
-    - name: commons-hosted-region
-      default: "https://raw.githubusercontent.com/open-toolchain/commons/master"
-    - name: insights
-      description: The variable storing DevOps Insight integration with the toolchain
-    - name: satellite-cluster-group
-      description: Satelite Cluster Group
-    - name: deployment-file
-    - name: pipeline-name
-    - name: cluster-namespace
   workspaces:
-    - name: pipeline-ws
-  tasks:
-    - name: git-clone
-      taskRef:
-        name: git-clone-repo
-      params:
-        - name: ibmcloud-apikey-secret-key
-          value: "toolchain-apikey"
-        - name: git-access-token
-          value: $(params.git-token)
-        - name: repository
-          value: $(params.source-repo)
-        - name: branch
-          value: $(params.deployment-branch)
-        - name: pipeline-debug
+    - name: artifacts
+      description: A workspace
+      mountPath: /artifacts
+  steps:
+    - name: execute
+      image: icr.io/continuous-delivery/pipeline/pipeline-base-ubi:3.2
+      workingDir: /artifacts
+      env:
+        - name: BUILD_NUMBER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/build-number']
+        - name: PIPELINE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/pipeline-id']
+        - name: PIPELINE_STAGE_EXECUTION_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/tekton-pipeline']
+        - name: PIPELINE_TRIGGERING_USER
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['devops.cloud.ibm.com/triggered-by']
+        - name: PIPELINE_BLUEMIX_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: $(params.continuous-delivery-context-secret)
+              key: $(params.kubernetes-service-apikey-secret-key)
+        - name: PIPELINE_BLUEMIX_RESOURCE_GROUP
+          value: $(params.resource-group)
+        - name: PIPELINE_IMAGE_URL
+          value: $(params.image-url)
+        - name: SHUTTLE_PROPERTIES_FILE
+          value: $(params.shuttle-properties-file)
+        - name: PIPELINE_DEBUG
           value: $(params.pipeline-debug)
-      workspaces:
-        - name: output
-          workspace: pipeline-ws
-    - name: perform-deployment
-      taskRef:
-        name: execute-on-satelite
-      runAfter: [git-clone]
-      params:
-        - name: shuttle-properties-file
-          value: "build.properties"
         - name: directory-path
           value: $(params.directory-path)
-        - name: setup-script
-          value: |
-            export CLUSTER_NAMESPACE="$(params.cluster-namespace)"
-            export APP_NAME="$(params.configuration-name)"
-            export MANIFEST_DIR="$(params.directory-path)"
-            export SATELLITE_CLUSTER_GROUP="$(params.satellite-cluster-group)"
-            export DEPLOYMENT_FILE="$(params.deployment-file)" 
-            echo "SATELLITE_CLUSTER_GROUP $SATELLITE_CLUSTER_GROUP"
-            echo "DEPLOYMENT_FILE $DEPLOYMENT_FILE"
-        - name: script
-          value: |
-            echo "CLUSTER_NAMESPACE :- ${CLUSTER_NAMESPACE}"
-            echo "SATELLITE_CLUSTER_GROUP :- ${SATELLITE_CLUSTER_GROUP}"
-            echo "MANIFEST_DIR $MANIFEST_DIR"
-            source <(curl -sSL "$(params.commons-hosted-region)/scripts/deploy_to_satellite.sh")
-        - name: post-execution-script
-          value: |
-            # Keep APP_URL in build.properties shuttle file
-        - name: pipeline-debug
-          value: $(params.pipeline-debug)
-      workspaces:
-        - name: artifacts
-          workspace: pipeline-ws
+      script: |
+        #!/bin/bash
+        set -e -o pipefail
+        if [ $PIPELINE_DEBUG == 1 ]; then
+            env
+            pwd
+            ls -l
+            echo "=== cat /artifacts/_toolchain.json ==="
+            cat /artifacts/_toolchain.json
+            echo ""
+            echo "======================================"
+            trap env EXIT
+            set -x
+        fi
+        # SETUP BEGIN
+        ibmcloud config --check-version false
+        ibmcloud login -a $(params.ibmcloud-api) --apikey $PIPELINE_BLUEMIX_API_KEY --no-region
+        if [ "$PIPELINE_BLUEMIX_RESOURCE_GROUP" ]; then
+          ibmcloud target -g "$PIPELINE_BLUEMIX_RESOURCE_GROUP"
+        fi
+       
+        export PIPELINE_TOOLCHAIN_ID=$(jq -r '.toolchain_guid' /artifacts/_toolchain.json)
+        if [ "$SHUTTLE_PROPERTIES_FILE" ]; then
+          source $SHUTTLE_PROPERTIES_FILE
+          export $(cut -d= -f1 $SHUTTLE_PROPERTIES_FILE)
+        fi
+        $(params.setup-script)
+        # DO THE WORK
+        $(params.script)
+        $(params.post-execution-script)
+        # Record task results
+      volumeMounts:
+        - mountPath: /cd-config
+          name: cd-config-volume
+        - mountPath: /steps
+          name: steps-volume
+        - mountPath: /artifacts/_toolchain.json
+          subPath: toolchain.json
+          name: cd-config-volume
+        - name: environment-properties
+          mountPath: /cd-config/environment-properties
+        - name: secure-properties
+          mountPath: /cd-config/secure-properties
+  volumes:
+    - name: steps-volume
+      emptyDir: {}
+    - name: cd-config-volume
+      configMap:
+        name: toolchain
+        items:
+          - key: toolchain.json
+            path: toolchain.json
+    - name: environment-properties
+      configMap:
+        name: environment-properties
+    - name: secure-properties
+      secret:
+        secretName: secure-properties
